@@ -150,7 +150,7 @@ fn main() -> anyhow::Result<()> {
     opts.io_workers(args.io_workers);
     opts.commit_concurrency(args.commit_concurrency);
     opts.path(args.path);
-    opts.hashtable_buckets(hashtable_buckets);
+    opts.hashtable_buckets(args.hashtable_buckets);
 
     let nomt = Nomt::<Blake3Hasher>::open(opts)?;
     let mut session = nomt.begin_session();
