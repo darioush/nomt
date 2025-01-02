@@ -127,6 +127,11 @@ struct Args {
     /// Number of commit workers
     #[arg(short, long, default_value = "1")]
     commit_concurrency: usize,
+
+
+    // Number of hashtable buckets
+    #[arg(short, long, default_value = "64000")]
+    hashtable_buckets: u32,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -145,6 +150,7 @@ fn main() -> anyhow::Result<()> {
     opts.io_workers(args.io_workers);
     opts.commit_concurrency(args.commit_concurrency);
     opts.path(args.path);
+    opts.hashtable_buckets(hashtable_buckets);
 
     let nomt = Nomt::<Blake3Hasher>::open(opts)?;
     let mut session = nomt.begin_session();
