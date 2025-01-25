@@ -6,12 +6,12 @@
 use crate::{
     beatree, bitbox,
     io::{self, page_pool::FatPage, IoPool, PagePool},
-    merkle,
-    page_cache::PageCache,
+    page_cache::{Page, PageCache},
     page_diff::PageDiff,
     rollback::Rollback,
     ValueHasher,
 };
+use flock::Flock;
 use meta::Meta;
 use nomt_core::{page_id::PageId, trie::KeyPath};
 use parking_lot::Mutex;
@@ -24,7 +24,7 @@ use std::{
 use std::os::unix::fs::OpenOptionsExt as _;
 
 pub use self::page_loader::{PageLoad, PageLoader};
-pub use bitbox::{BucketIndex, HashTableUtilization};
+pub use bitbox::{BucketIndex, HashTableUtilization, SharedMaybeBucketIndex};
 
 mod flock;
 mod meta;
@@ -42,7 +42,6 @@ struct Shared {
     values: beatree::Tree,
     pages: bitbox::DB,
     rollback: Option<Rollback>,
-    page_pool: PagePool,
     io_pool: IoPool,
     meta_fd: File,
     #[allow(unused)]
@@ -55,21 +54,36 @@ struct Shared {
 impl Store {
     /// Open the store with the provided `Options`.
     pub fn open(o: &crate::Options, page_pool: PagePool) -> anyhow::Result<Self> {
-        let db_dir_fd = if !o.path.exists() {
+        let db_dir_fd;
+        let flock;
+
+        if !o.path.exists() {
             // NB: note TOCTOU here. Deemed acceptable for this case.
-            create(&page_pool, &o)?
+            (db_dir_fd, flock) = create(&page_pool, &o)?;
         } else {
             let mut options = OpenOptions::new();
             options.read(true);
-            options.open(&o.path)?
-        };
+            db_dir_fd = options.open(&o.path)?;
+            flock = flock::Flock::lock(&o.path, ".lock")?;
+        }
         let db_dir_fd = Arc::new(db_dir_fd);
-        let flock = flock::Flock::lock(&o.path, ".lock")?;
 
         cfg_if::cfg_if! {
             if #[cfg(target_os = "linux")] {
-                let is_tmpfs = crate::sys::linux::tmpfs_check(&db_dir_fd);
-                let iopoll = !is_tmpfs;
+                // iopoll does not play nice with FUSE and tmpfs. A symptom is ENOSUPP.
+                // O_DIRECT is not supported on tmpfs.
+                let iopoll: bool;
+                let o_direct: bool;
+                match crate::sys::linux::fs_check(&db_dir_fd) {
+                    Ok(fsck) => {
+                        iopoll = !(fsck.is_fuse() || fsck.is_tmpfs());
+                        o_direct = !fsck.is_tmpfs();
+                    },
+                    Err(_) => {
+                        iopoll = false;
+                        o_direct = false;
+                    },
+                }
             } else {
                 let iopoll = true;
             }
@@ -81,7 +95,7 @@ impl Store {
             let mut options = OpenOptions::new();
             options.read(true).write(true);
             #[cfg(target_os = "linux")]
-            if !is_tmpfs {
+            if o_direct {
                 options.custom_flags(libc::O_DIRECT);
             }
             options.open(&o.path.join("meta"))?
@@ -91,7 +105,7 @@ impl Store {
             let mut options = OpenOptions::new();
             options.read(true).write(true);
             #[cfg(target_os = "linux")]
-            if !is_tmpfs {
+            if o_direct {
                 options.custom_flags(libc::O_DIRECT);
             }
             Arc::new(options.open(&o.path.join("ln"))?)
@@ -100,7 +114,7 @@ impl Store {
             let mut options = OpenOptions::new();
             options.read(true).write(true);
             #[cfg(target_os = "linux")]
-            if !is_tmpfs {
+            if o_direct {
                 options.custom_flags(libc::O_DIRECT);
             }
             Arc::new(options.open(&o.path.join("bbn"))?)
@@ -109,7 +123,7 @@ impl Store {
             let mut options = OpenOptions::new();
             options.read(true).write(true);
             #[cfg(target_os = "linux")]
-            if !is_tmpfs {
+            if o_direct {
                 options.custom_flags(libc::O_DIRECT);
             }
             options.open(&o.path.join("ht"))?
@@ -118,7 +132,7 @@ impl Store {
             let options = &mut OpenOptions::new();
             options.read(true).write(true);
             #[cfg(target_os = "linux")]
-            if !is_tmpfs {
+            if o_direct {
                 options.custom_flags(libc::O_DIRECT);
             }
             options.open(&o.path.join("wal"))?
@@ -179,7 +193,6 @@ impl Store {
             ))),
             shared: Arc::new(Shared {
                 rollback,
-                page_pool,
                 values,
                 pages,
                 io_pool,
@@ -188,6 +201,10 @@ impl Store {
                 flock,
             }),
         })
+    }
+
+    pub fn sync_seqn(&self) -> u32 {
+        self.sync.lock().sync_seqn
     }
 
     /// Returns a handle to the rollback object. `None` if the rollback feature is not enabled.
@@ -239,7 +256,7 @@ impl Store {
         &self.shared.io_pool
     }
 
-    /// Get the hash-table bucket counts.
+    /// Get the current hash-table bucket counts.
     pub fn hash_table_utilization(&self) -> HashTableUtilization {
         self.shared.pages.utilization()
     }
@@ -255,9 +272,9 @@ impl Store {
     /// updated values.
     pub fn commit(
         &self,
-        value_tx: ValueTransaction,
+        value_tx: impl IntoIterator<Item = (beatree::Key, beatree::ValueChange)> + Send + 'static,
         page_cache: PageCache,
-        page_diffs: merkle::PageDiffs,
+        updated_pages: impl IntoIterator<Item = (PageId, DirtyPage)> + Send + 'static,
     ) -> anyhow::Result<()> {
         let mut sync = self.sync.lock();
 
@@ -268,7 +285,7 @@ impl Store {
             self.shared.values.clone(),
             self.shared.rollback.clone(),
             page_cache,
-            page_diffs,
+            updated_pages,
         )
         .unwrap();
         Ok(())
@@ -278,67 +295,78 @@ impl Store {
 /// An atomic transaction on raw key/value pairs to be applied against the store
 /// with [`Store::commit`].
 pub struct ValueTransaction {
-    batch: Vec<(KeyPath, beatree::ValueChange)>,
+    batch: Vec<(beatree::Key, beatree::ValueChange)>,
 }
 
 impl ValueTransaction {
     /// Write a value to flat storage.
-    pub fn write_value<T: ValueHasher>(&mut self, path: KeyPath, value: Option<Vec<u8>>) {
+    pub fn write_value<T: ValueHasher>(&mut self, path: beatree::Key, value: Option<Vec<u8>>) {
         self.batch
             .push((path, beatree::ValueChange::from_option::<T>(value)))
     }
+
+    /// Iterate all the changed values.
+    pub fn into_iter(self) -> impl Iterator<Item = (beatree::Key, beatree::ValueChange)> {
+        self.batch.into_iter()
+    }
 }
 
-/// An atomic transaction on merkle tree pages to be applied against the store
-/// with [`Store::commit`].
-pub struct MerkleTransaction {
-    pub(crate) page_pool: PagePool,
-    pub(crate) bucket_allocator: bitbox::BucketAllocator,
-    pub(crate) new_pages: Vec<(PageId, BucketIndex, Option<(FatPage, PageDiff)>)>,
+/// Information about the bucket associated with a page.
+///
+/// This is either a firmly known bucket index or a pending bucket index which will be determined
+/// when the overlay is written.
+///
+/// The only overhead for non-fresh pages is the overhead of an enum. For fresh pages, there is an
+/// allocation and atomic overhead.
+#[derive(Clone)]
+pub enum BucketInfo {
+    /// The bucket index is known.
+    Known(BucketIndex),
+    /// The page is fresh and there are no dependents (i.e. overlays) which would require the result
+    /// of the page allocation.
+    FreshWithNoDependents,
+    /// The bucket index is either fresh or dependent on the bucket allocation of a fresh page
+    /// within an earlier overlay.
+    ///
+    /// This variant is specifically needed for storage overlays.
+    /// When a fresh page is first inserted into an overlay, its bucket is pending. This state is
+    /// shared with all subsequent overlays. The bucket is determined when the overlay first
+    /// containing the fresh page is committed. The allocated page will automatically propagate to
+    /// all dependent overlays.
+    ///
+    /// Without this shared state, it would be possible to lose track of the allocated bucket index
+    /// from one overlay to the next.
+    FreshOrDependent(SharedMaybeBucketIndex),
 }
 
-impl MerkleTransaction {
-    /// Write a page to storage in its entirety.
-    pub fn write_page(
-        &mut self,
-        page_id: PageId,
-        bucket: Option<BucketIndex>,
-        page: &FatPage,
-        page_diff: PageDiff,
-    ) -> BucketIndex {
-        let bucket_index =
-            bucket.unwrap_or_else(|| self.bucket_allocator.allocate(page_id.clone()));
-
-        // Perform a deep clone of the page. For that allocate a new page and copy the data over.
-        //
-        // TODO: get rid of this copy.
-        let mut new_page = self.page_pool.alloc_fat_page();
-        new_page.copy_from_slice(page);
-
-        self.new_pages
-            .push((page_id, bucket_index, Some((new_page, page_diff))));
-        bucket_index
-    }
-
-    /// Delete a page from storage.
-    pub fn delete_page(&mut self, page_id: PageId, bucket: BucketIndex) {
-        self.bucket_allocator.free(bucket);
-        self.new_pages.push((page_id, bucket, None));
-    }
+/// A dirty page to be written to the store.
+#[derive(Clone)]
+pub struct DirtyPage {
+    /// The (frozen) page.
+    pub page: Page,
+    /// The diff between this page and the last revision.
+    pub diff: PageDiff,
+    /// The bucket info associated with the page.
+    pub bucket: BucketInfo,
 }
 
 /// Creates and initializes a new empty database at the specified path.
 ///
 /// This function:
 /// - Creates all necessary directories along the path
+/// - Locks the directory
 /// - Initializes required database files
-/// - Returns a file descriptor for the database directory
+/// - Returns a file descriptor for the database directory along with a lock handle.
 ///
 /// The database directory must not exist when calling this function.
-fn create(page_pool: &PagePool, o: &crate::Options) -> anyhow::Result<File> {
+fn create(page_pool: &PagePool, o: &crate::Options) -> anyhow::Result<(File, Flock)> {
     // Create the directory and its parent directories.
     std::fs::create_dir_all(&o.path)?;
     let db_dir_fd = std::fs::File::open(&o.path)?;
+
+    // It's important that the lock is taken before creating modifying the directory contents.
+    // Because otherwise different instances could fight for changes.
+    let flock = Flock::lock(&o.path, ".lock")?;
 
     let meta_fd = std::fs::File::create(o.path.join("meta"))?;
     let meta = Meta::create_new(o.bitbox_seed, o.bitbox_num_pages);
@@ -351,5 +379,5 @@ fn create(page_pool: &PagePool, o: &crate::Options) -> anyhow::Result<File> {
     // As the last step, sync the directory. This makes sure that the directory is properly
     // written to disk.
     db_dir_fd.sync_all()?;
-    Ok(db_dir_fd)
+    Ok((db_dir_fd, flock))
 }

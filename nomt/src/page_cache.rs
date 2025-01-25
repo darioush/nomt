@@ -2,10 +2,8 @@ use crate::{
     bitbox::BucketIndex,
     io::{page_pool::FatPage, PagePool, PAGE_SIZE},
     metrics::{Metric, Metrics},
-    page_diff::PageDiff,
     page_region::PageRegion,
-    rw_pass_cell::{ReadPass, Region, RegionContains, RwPassCell, RwPassDomain, WritePass},
-    store::MerkleTransaction,
+    rw_pass_cell::{Region, RegionContains, RwPassDomain, WritePass},
     Options,
 };
 use fxhash::FxBuildHasher;
@@ -23,52 +21,67 @@ use std::{fmt, num::NonZeroUsize, sync::Arc};
 // (2^(DEPTH + 1)) - 2
 pub const NODES_PER_PAGE: usize = (1 << DEPTH + 1) - 2;
 
-struct PageData {
-    data: RwPassCell<Option<FatPage>, ShardIndex>,
+fn read_node(data: &FatPage, index: usize) -> Node {
+    assert!(index < NODES_PER_PAGE, "index out of bounds");
+    let start = index * 32;
+    let end = start + 32;
+    let mut node = [0; 32];
+    node.copy_from_slice(&data[start..end]);
+    node
 }
 
-impl PageData {
-    /// Creates a page with the given data.
-    fn pristine_with_data(domain: &RwPassDomain, shard_index: ShardIndex, data: FatPage) -> Self {
-        Self {
-            data: domain.protect_with_id(Some(data), shard_index),
+fn set_node(data: &mut FatPage, index: usize, node: Node) {
+    assert!(index < NODES_PER_PAGE, "index out of bounds");
+    let start = index * 32;
+    let end = start + 32;
+    data[start..end].copy_from_slice(&node);
+}
+
+/// A mutable page.
+pub struct PageMut {
+    inner: FatPage,
+}
+
+impl PageMut {
+    /// Freeze the page.
+    pub fn freeze(self) -> Page {
+        Page {
+            inner: Arc::new(self.inner),
         }
     }
 
-    /// Creates an empty page.
-    fn pristine_empty(domain: &RwPassDomain, shard_index: ShardIndex) -> Self {
-        Self {
-            data: domain.protect_with_id(None, shard_index),
-        }
+    /// Create a pristine (i.e. logically blank) `PageMut`.
+    ///
+    /// Note that this is not actually guaranteed to be blank, because pages in the pool are not
+    /// zeroed prior to use. However, within the context of the trie, no search should require
+    /// reading from a blank page.
+    pub fn pristine_empty(page_pool: &PagePool, page_id: &PageId) -> PageMut {
+        let mut page = PageMut {
+            inner: page_pool.alloc_fat_page(),
+        };
+        page.inner[PAGE_SIZE - 32..].copy_from_slice(&page_id.encode());
+        page
     }
 
-    fn node(&self, read_pass: &ReadPass<impl RegionContains<ShardIndex>>, index: usize) -> Node {
-        assert!(index < NODES_PER_PAGE, "index out of bounds");
-        let data = self.data.read(read_pass);
-        if let Some(data) = &*data {
-            let start = index * 32;
-            let end = start + 32;
-            let mut node = [0; 32];
-            node.copy_from_slice(&data[start..end]);
-            node
-        } else {
-            Node::default()
-        }
+    /// Create a mutable page from raw page data.
+    pub fn pristine_with_data(data: FatPage) -> PageMut {
+        PageMut { inner: data }
     }
 
-    fn set_node(
-        &self,
-        page_pool: &PagePool,
-        write_pass: &mut WritePass<impl RegionContains<ShardIndex>>,
-        index: usize,
-        node: Node,
-    ) {
-        assert!(index < NODES_PER_PAGE, "index out of bounds");
-        let mut data = self.data.write(write_pass);
-        let data = data.get_or_insert_with(|| page_pool.alloc_fat_page());
-        let start = index * 32;
-        let end = start + 32;
-        data[start..end].copy_from_slice(&node);
+    /// Read out the node at the given index.
+    pub fn node(&self, index: usize) -> Node {
+        read_node(&self.inner, index)
+    }
+
+    /// Write the node at the given index.
+    pub fn set_node(&mut self, index: usize, node: Node) {
+        set_node(&mut self.inner, index, node)
+    }
+}
+
+impl From<FatPage> for PageMut {
+    fn from(data: FatPage) -> PageMut {
+        Self::pristine_with_data(data)
     }
 }
 
@@ -77,28 +90,30 @@ impl PageData {
 /// Can be cloned cheaply.
 #[derive(Clone)]
 pub struct Page {
-    inner: Arc<PageData>,
+    inner: Arc<FatPage>,
 }
 
 impl Page {
     /// Read out the node at the given index.
-    pub fn node(
-        &self,
-        read_pass: &ReadPass<impl RegionContains<ShardIndex>>,
-        index: usize,
-    ) -> Node {
-        self.inner.node(read_pass, index)
+    pub fn node(&self, index: usize) -> Node {
+        read_node(&self.inner, index)
     }
 
-    /// Write the node at the given index.
-    pub fn set_node(
-        &self,
-        page_pool: &PagePool,
-        write_pass: &mut WritePass<impl RegionContains<ShardIndex>>,
-        index: usize,
-        node: Node,
-    ) {
-        self.inner.set_node(page_pool, write_pass, index, node);
+    /// Create a mutable deep copy of this page.
+    pub fn deep_copy(&self) -> PageMut {
+        PageMut {
+            inner: FatPage::clone(&self.inner),
+        }
+    }
+
+    /// Get a reference to the underlying page data.
+    pub fn page_data(&self) -> &FatPage {
+        &self.inner
+    }
+
+    /// Transform this into the underlying page.
+    pub fn into_inner(self) -> Arc<FatPage> {
+        self.inner
     }
 }
 
@@ -109,26 +124,15 @@ impl fmt::Debug for Page {
 }
 
 struct CacheEntry {
-    page_data: Arc<PageData>,
-    // the bucket index where this page is stored. `None` if it's a fresh page.
-    bucket_index: Option<BucketIndex>,
+    page_data: Arc<FatPage>,
+    bucket_index: BucketIndex,
 }
 
 impl CacheEntry {
-    fn init(
-        domain: &RwPassDomain,
-        shard_index: ShardIndex,
-        maybe_page: Option<(FatPage, BucketIndex)>,
-    ) -> Self {
-        match maybe_page {
-            Some((data, bucket_index)) => CacheEntry {
-                page_data: Arc::new(PageData::pristine_with_data(domain, shard_index, data)),
-                bucket_index: Some(bucket_index),
-            },
-            None => CacheEntry {
-                page_data: Arc::new(PageData::pristine_empty(domain, shard_index)),
-                bucket_index: None,
-            },
+    fn init(page_data: Arc<FatPage>, bucket_index: BucketIndex) -> Self {
+        CacheEntry {
+            page_data,
+            bucket_index,
         }
     }
 }
@@ -155,7 +159,7 @@ impl CacheShardLocked {
 
 struct Shared {
     shards: Vec<CacheShard>,
-    root_page: RwLock<CacheEntry>,
+    root_page: RwLock<Option<CacheEntry>>,
     page_rw_pass_domain: RwPassDomain,
     metrics: Metrics,
 }
@@ -245,10 +249,14 @@ impl PageCache {
         metrics: impl Into<Option<Metrics>>,
     ) -> Self {
         let domain = RwPassDomain::new();
+
+        let root_page_entry =
+            root_page_data.map(|(page, bucket)| CacheEntry::init(Arc::new(page), bucket));
+
         Self {
             shared: Arc::new(Shared {
                 shards: make_shards(o.commit_concurrency, o.page_cache_size),
-                root_page: RwLock::new(CacheEntry::init(&domain, ShardIndex::Root, root_page_data)),
+                root_page: RwLock::new(root_page_entry),
                 page_rw_pass_domain: domain,
                 metrics: metrics.into().unwrap_or(Metrics::new(false)),
             }),
@@ -271,58 +279,35 @@ impl PageCache {
     /// Query the cache for the page data at the given [`PageId`].
     ///
     /// Returns `None` if not in the cache.
-    pub fn get(&self, page_id: PageId) -> Option<Page> {
+    pub fn get(&self, page_id: PageId) -> Option<(Page, BucketIndex)> {
         self.shared.metrics.count(Metric::PageRequests);
         let shard_index = match self.shard_index_for(&page_id) {
             None => {
-                let page_data = self.shared.root_page.read().page_data.clone();
-                return Some(Page { inner: page_data });
+                let cache_item = self.shared.root_page.read();
+                let cache_item = cache_item.as_ref()?;
+                return Some((
+                    Page {
+                        inner: cache_item.page_data.clone(),
+                    },
+                    cache_item.bucket_index,
+                ));
             }
             Some(i) => i,
         };
 
         let mut shard = self.shard(shard_index).locked.lock();
         match shard.cached.get(&page_id) {
-            Some(page) => Some(Page {
-                inner: page.page_data.clone(),
-            }),
+            Some(cache_item) => Some((
+                Page {
+                    inner: cache_item.page_data.clone(),
+                },
+                cache_item.bucket_index,
+            )),
             None => {
                 self.shared.metrics.count(Metric::PageCacheMisses);
                 None
             }
         }
-    }
-
-    /// Insert a page into the cache by its data. If `Some`, provide the bucket index where the
-    /// page is stored.
-    ///
-    /// This ignores the inputs if the page was already present, and returns that.
-    pub fn insert(&self, page_id: PageId, page: Option<(FatPage, BucketIndex)>) -> Page {
-        let domain = &self.shared.page_rw_pass_domain;
-        let shard_index = match self.shard_index_for(&page_id) {
-            None => {
-                let page_data = self.shared.root_page.read().page_data.clone();
-                return Page { inner: page_data };
-            }
-            Some(i) => i,
-        };
-
-        let mut shard = self.shard(shard_index).locked.lock();
-        let cache_entry = shard.cached.get_or_insert(page_id, || {
-            CacheEntry::init(domain, ShardIndex::Shard(shard_index), page)
-        });
-
-        Page {
-            inner: cache_entry.page_data.clone(),
-        }
-    }
-
-    /// Acquire a read pass for all pages in the cache.
-    pub fn new_read_pass(&self) -> ReadPass<ShardIndex> {
-        self.shared
-            .page_rw_pass_domain
-            .new_read_pass()
-            .with_region(ShardIndex::Root)
     }
 
     /// Acquire a write pass for all pages in the cache.
@@ -347,46 +332,40 @@ impl PageCache {
         self.shard(shard_index).region.clone()
     }
 
-    /// Get the shard with the given index. This can quickly answer queries directed at a particular
-    /// shard of the page cache, avoiding the overhead of determining which shard to use.
-    pub fn get_shard(&self, shard_index: usize) -> PageCacheShard {
-        PageCacheShard {
-            shared: self.shared.clone(),
-            shard_index,
+    /// Insert a page into the cache by its data. Provide the bucket index where the
+    /// page is stored if this was loaded from the disk.
+    ///
+    /// This ignores the inputs if the page was already present, and returns that.
+    pub fn insert(&self, page_id: PageId, page: Page, bucket_index: BucketIndex) -> Page {
+        let shard_index = match self.shard_index_for(&page_id) {
+            None => {
+                let mut cache_item = self.shared.root_page.write();
+                if let Some(root_page) = cache_item.as_ref() {
+                    return Page {
+                        inner: root_page.page_data.clone(),
+                    };
+                } else {
+                    *cache_item = Some(CacheEntry::init(page.inner.clone(), bucket_index));
+                    return page;
+                }
+            }
+            Some(i) => i,
+        };
+
+        let mut shard = self.shard(shard_index).locked.lock();
+        let cache_entry = shard
+            .cached
+            .get_or_insert(page_id, || CacheEntry::init(page.inner, bucket_index));
+
+        Page {
+            inner: cache_entry.page_data.clone(),
         }
     }
 
-    /// Prepares a transaction of altered pages, according to the provided page diffs.
-    /// This takes a read pass.
-    pub fn prepare_transaction(
-        &self,
-        page_diffs: impl IntoIterator<Item = (PageId, PageDiff)>,
-        tx: &mut MerkleTransaction,
-    ) {
-        let read_pass = self.new_read_pass();
-        let mut apply_page = |page_id,
-                              bucket: &mut Option<BucketIndex>,
-                              page_data: Option<&FatPage>,
-                              page_diff: PageDiff| {
-            match (page_data, *bucket) {
-                (None, Some(known_bucket)) => {
-                    tx.delete_page(page_id, known_bucket);
-                    *bucket = None;
-                }
-                (Some(_), Some(known_bucket)) if page_diff.cleared() => {
-                    tx.delete_page(page_id, known_bucket);
-                    *bucket = None;
-                }
-                (Some(page), maybe_bucket) if !page_diff.cleared() => {
-                    let new_bucket = tx.write_page(page_id, maybe_bucket, page, page_diff);
-                    *bucket = Some(new_bucket);
-                }
-                _ => {} // empty pages which had no known bucket. don't write or delete.
-            }
-        };
-
-        // helper for exploiting locality effects in the diffs to avoid searching through
-        // shards constantly.
+    /// Absorb a set of altered pages into the cache.
+    ///
+    /// A `None` value for a page indicates that it should be removed from the cache.
+    pub fn batch_update(&self, updated_pages: Vec<(PageId, Option<(Page, BucketIndex)>)>) {
         let mut shard_guards = self
             .shared
             .shards
@@ -394,26 +373,25 @@ impl PageCache {
             .map(|s| s.locked.lock())
             .collect::<Vec<_>>();
 
-        for (page_id, page_diff) in page_diffs {
+        for (page_id, maybe_page) in updated_pages {
             if page_id == ROOT_PAGE_ID {
                 let mut root_page = self.shared.root_page.write();
-                let root_page = &mut *root_page;
-                let page_data = root_page.page_data.data.read(&read_pass);
-                let bucket = &mut root_page.bucket_index;
-                apply_page(page_id, bucket, page_data.as_ref(), page_diff);
+                *root_page = maybe_page
+                    .map(|(page, bucket_index)| CacheEntry::init(page.inner, bucket_index));
+
                 continue;
             }
 
             // UNWRAP: all pages which are not the root page are in a shard.
             let shard_index = self.shard_index_for(&page_id).unwrap();
 
-            if let Some(ref mut entry) = shard_guards[shard_index].cached.peek_mut(&page_id) {
-                let page_data = entry.page_data.data.read(&read_pass);
-                let bucket = &mut entry.bucket_index;
-                apply_page(page_id, bucket, page_data.as_ref(), page_diff);
+            if let Some((page, bucket_index)) = maybe_page {
+                shard_guards[shard_index]
+                    .cached
+                    .put(page_id.clone(), CacheEntry::init(page.inner, bucket_index))
             } else {
-                panic!("dirty page {:?} is missing", page_id);
-            }
+                shard_guards[shard_index].cached.pop(&page_id)
+            };
         }
     }
 
@@ -434,66 +412,6 @@ impl PageCache {
 
     fn shard(&self, index: usize) -> &CacheShard {
         &self.shared.shards[index]
-    }
-}
-
-/// A shard of the page cache. This should only be used for pages which fall within
-/// that shard, with the exception of the root page, which is accessible via this shard.
-pub struct PageCacheShard {
-    shared: Arc<Shared>,
-    shard_index: usize,
-}
-
-impl PageCacheShard {
-    /// Query the cache for the page data at the given [`PageId`].
-    ///
-    /// Returns `None` if not in the cache.
-    pub fn get(&self, page_id: PageId) -> Option<Page> {
-        self.shared.metrics.count(Metric::PageRequests);
-        if page_id == ROOT_PAGE_ID {
-            let page_data = self.shared.root_page.read().page_data.clone();
-            return Some(Page { inner: page_data });
-        }
-
-        debug_assert!(self.shared.shards[self.shard_index]
-            .region
-            .contains_exclusive(&page_id));
-
-        let mut shard = self.shared.shards[self.shard_index].locked.lock();
-        match shard.cached.get(&page_id) {
-            Some(page) => Some(Page {
-                inner: page.page_data.clone(),
-            }),
-            None => {
-                self.shared.metrics.count(Metric::PageCacheMisses);
-                None
-            }
-        }
-    }
-
-    /// Insert a page into the cache by its data. If `Some`, provide the bucket index where the
-    /// page is stored.
-    ///
-    /// This ignores the inputs if the page was already present, and returns that.
-    pub fn insert(&self, page_id: PageId, page: Option<(FatPage, BucketIndex)>) -> Page {
-        let domain = &self.shared.page_rw_pass_domain;
-        if page_id == ROOT_PAGE_ID {
-            let page_data = self.shared.root_page.read().page_data.clone();
-            return Page { inner: page_data };
-        }
-
-        debug_assert!(self.shared.shards[self.shard_index]
-            .region
-            .contains_exclusive(&page_id));
-
-        let mut shard = self.shared.shards[self.shard_index].locked.lock();
-        let cache_entry = shard.cached.get_or_insert(page_id, || {
-            CacheEntry::init(domain, ShardIndex::Shard(self.shard_index), page)
-        });
-
-        Page {
-            inner: cache_entry.page_data.clone(),
-        }
     }
 }
 

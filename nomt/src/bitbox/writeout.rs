@@ -9,6 +9,7 @@ use std::{
     fs::File,
     io::{Seek as _, SeekFrom, Write},
     os::fd::AsRawFd as _,
+    sync::Arc,
 };
 
 use crate::io::{FatPage, IoCommand, IoHandle, IoKind};
@@ -21,16 +22,22 @@ pub(super) fn write_wal(mut wal_fd: &File, wal_blob: &[u8]) -> anyhow::Result<()
     Ok(())
 }
 
-pub(super) fn truncate_wal(mut wal_fd: &File) -> anyhow::Result<()> {
+/// Truncates the WAL file to zero length.
+///
+/// Conditionally syncs the file to disk.
+pub(super) fn truncate_wal(mut wal_fd: &File, do_sync: bool) -> anyhow::Result<()> {
     wal_fd.set_len(0)?;
     wal_fd.seek(SeekFrom::Start(0))?;
+    if do_sync {
+        wal_fd.sync_all()?;
+    }
     Ok(())
 }
 
 pub(super) fn write_ht(
     io_handle: IoHandle,
     ht_fd: &File,
-    mut ht: Vec<(u64, FatPage)>,
+    mut ht: Vec<(u64, Arc<FatPage>)>,
 ) -> anyhow::Result<()> {
     let mut sent = 0;
 
@@ -38,7 +45,7 @@ pub(super) fn write_ht(
     for (pn, page) in ht {
         io_handle
             .send(IoCommand {
-                kind: IoKind::Write(ht_fd.as_raw_fd(), pn, page),
+                kind: IoKind::WriteArc(ht_fd.as_raw_fd(), pn, page),
                 user_data: 0,
             })
             .unwrap();

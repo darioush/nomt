@@ -3,7 +3,7 @@ std::compile_error!("NOMT only supports Unix-based OSs");
 
 use crossbeam_channel::{Receiver, RecvError, SendError, Sender, TryRecvError};
 use page_pool::Page;
-use std::{fmt, fs::File, os::fd::RawFd};
+use std::{fmt, fs::File, os::fd::RawFd, sync::Arc};
 
 #[cfg(target_os = "linux")]
 #[path = "linux.rs"]
@@ -23,6 +23,7 @@ pub use page_pool::{FatPage, PagePool};
 pub enum IoKind {
     Read(RawFd, u64, FatPage),
     Write(RawFd, u64, FatPage),
+    WriteArc(RawFd, u64, Arc<FatPage>),
     WriteRaw(RawFd, u64, Page),
 }
 
@@ -31,6 +32,7 @@ impl fmt::Debug for IoKind {
         match self {
             IoKind::Read(fd, pn, _) => write!(f, "Read(fd={}, pn={})", fd, pn),
             IoKind::Write(fd, pn, _) => write!(f, "Write(fd={}, pn={})", fd, pn),
+            IoKind::WriteArc(fd, pn, _) => write!(f, "WriteArc(fd={}, pn={})", fd, pn),
             IoKind::WriteRaw(fd, pn, _) => write!(f, "WriteRaw(fd={}, pn={})", fd, pn),
         }
     }
@@ -46,6 +48,7 @@ impl IoKind {
     pub fn unwrap_buf(self) -> FatPage {
         match self {
             IoKind::Read(_, _, buf) | IoKind::Write(_, _, buf) => buf,
+            IoKind::WriteArc(_, _, _) => panic!("attempted to extract owned buf from write_arc"),
             IoKind::WriteRaw(_, _, _) => panic!("attempted to extract buf from write_raw"),
         }
     }
@@ -74,8 +77,6 @@ impl IoKind {
         }
     }
 }
-
-unsafe impl Send for IoKind {}
 
 pub struct IoCommand {
     pub kind: IoKind,

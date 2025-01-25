@@ -4,6 +4,7 @@
 
 use anyhow::Context;
 use crossbeam::channel::{self, Receiver, Sender};
+use page_set::FrozenSharedPageSet;
 use parking_lot::Mutex;
 
 use nomt_core::{
@@ -17,27 +18,38 @@ use std::{collections::HashMap, sync::Arc};
 
 use crate::{
     io::PagePool,
-    page_cache::{PageCache, ShardIndex},
-    page_diff::PageDiff,
+    overlay::LiveOverlay,
+    page_cache::{Page, PageCache, ShardIndex},
     rw_pass_cell::WritePassEnvelope,
-    store::Store,
+    store::{BucketInfo, DirtyPage, Store},
     HashAlgorithm, Witness, WitnessedOperations, WitnessedPath, WitnessedRead, WitnessedWrite,
 };
 use threadpool::ThreadPool;
 
+mod page_set;
 mod page_walker;
 mod seek;
 mod worker;
 
-/// Page diffs produced by update workers.
-pub struct PageDiffs(Vec<Vec<(PageId, PageDiff)>>);
+pub use page_walker::UpdatedPage;
 
-impl IntoIterator for PageDiffs {
-    type Item = (PageId, PageDiff);
-    type IntoIter = std::iter::Flatten<<Vec<Vec<Self::Item>> as IntoIterator>::IntoIter>;
+/// Updated pages produced by update workers.
+pub struct UpdatedPages(Vec<Vec<UpdatedPage>>);
 
-    fn into_iter(self) -> Self::IntoIter {
-        self.0.into_iter().flatten()
+impl UpdatedPages {
+    /// Freeze, label, and iterate all the pages.
+    ///
+    /// Pages are 'labeled' by placing the page ID into the page data itself prior to freezing.
+    pub fn into_frozen_iter(self) -> impl Iterator<Item = (PageId, DirtyPage)> {
+        self.0.into_iter().flatten().map(|updated_page| {
+            let page = updated_page.page.freeze();
+            let dirty = DirtyPage {
+                page,
+                diff: updated_page.diff,
+                bucket: updated_page.bucket_info,
+            };
+            (updated_page.page_id, dirty)
+        })
     }
 }
 
@@ -111,10 +123,12 @@ impl UpdatePool {
         page_cache: PageCache,
         page_pool: PagePool,
         store: Store,
+        overlay: LiveOverlay,
         root: Node,
     ) -> Updater {
         let params = worker::WarmUpParams {
             page_cache: page_cache.clone(),
+            overlay: overlay.clone(),
             store: store.clone(),
             root,
         };
@@ -132,6 +146,7 @@ impl UpdatePool {
             root,
             store,
             page_pool,
+            overlay,
         }
     }
 }
@@ -146,6 +161,7 @@ pub struct Updater {
     root: Node,
     store: Store,
     page_pool: PagePool,
+    overlay: LiveOverlay,
 }
 
 impl Updater {
@@ -157,19 +173,25 @@ impl Updater {
     }
 
     /// Update the trie with the given key-value read/write operations.
+    ///
     /// Key-paths should be in sorted order
     /// and should appear at most once within the vector. Witness specifies whether or not
     /// to collect the witness of the operation.
+    /// `into_overlay` specifies whether the results of this will be committed into an overlay,
+    /// disabling certain optimizations.
     pub fn update_and_prove<H: HashAlgorithm>(
         self,
         read_write: Vec<(KeyPath, KeyReadWrite)>,
         witness: bool,
+        into_overlay: bool,
     ) -> UpdateHandle {
         if let Some(ref warm_up) = self.warm_up {
             let _ = warm_up.finish_tx.send(());
         }
         let shared = Arc::new(UpdateShared {
             witness,
+            into_overlay,
+            overlay: self.overlay.clone(),
             read_write,
             root_page_pending: Mutex::new(Vec::with_capacity(64)),
         });
@@ -179,10 +201,11 @@ impl Updater {
 
         // receive warm-ups from worker.
         // TODO: handle error better.
-        let warm_ups = if let Some(ref warm_up) = self.warm_up {
-            warm_up.output_rx.recv().unwrap()
+        let (warm_ups, warm_page_set) = if let Some(ref warm_up) = self.warm_up {
+            let output = warm_up.output_rx.recv().unwrap();
+            (output.paths, Some(output.pages))
         } else {
-            HashMap::new()
+            (HashMap::new(), None)
         };
         let warm_ups = Arc::new(warm_ups);
 
@@ -203,6 +226,7 @@ impl Updater {
                 store: self.store.clone(),
                 root: self.root,
                 warm_ups: warm_ups.clone(),
+                warm_page_set: warm_page_set.clone(),
                 command,
                 worker_id,
             };
@@ -238,7 +262,7 @@ impl UpdateHandle {
             writes: Vec::new(),
         });
 
-        let mut page_diffs = Vec::new();
+        let mut updated_pages = Vec::new();
 
         let mut path_proof_offset = 0;
         let mut witnessed_start = 0;
@@ -254,7 +278,7 @@ impl UpdateHandle {
                 new_root = Some(root);
             }
 
-            page_diffs.push(output.page_diffs);
+            updated_pages.push(output.updated_pages);
 
             // if the Commit worker collected the witnessed paths
             // then we need to aggregate them
@@ -310,7 +334,7 @@ impl UpdateHandle {
         // UNWRAP: one thread always produces the root.
         Output {
             root: new_root.unwrap(),
-            page_diffs: PageDiffs(page_diffs),
+            updated_pages: UpdatedPages(updated_pages),
             witness: maybe_witness,
             witnessed_operations: maybe_witnessed_ops,
         }
@@ -321,8 +345,8 @@ impl UpdateHandle {
 pub struct Output {
     /// The new root.
     pub root: Node,
-    /// All page-diffs from all worker threads. The covered sets of pages are disjoint.
-    pub page_diffs: PageDiffs,
+    /// All updated pages from all worker threads. The covered sets of pages are disjoint.
+    pub updated_pages: UpdatedPages,
     /// Optional witness
     pub witness: Option<Witness>,
     /// Optional list of all witnessed operations.
@@ -338,6 +362,11 @@ struct WarmUpCommand {
     key_path: KeyPath,
 }
 
+struct WarmUpOutput {
+    pages: FrozenSharedPageSet,
+    paths: HashMap<KeyPath, Seek>,
+}
+
 enum RootPagePending {
     SubTrie {
         range_start: usize,
@@ -350,7 +379,7 @@ enum RootPagePending {
 struct WorkerOutput {
     root: Option<Node>,
     witnessed_paths: Option<Vec<(WitnessedPath, Option<trie::LeafData>, usize)>>,
-    page_diffs: Vec<(PageId, PageDiff)>,
+    updated_pages: Vec<UpdatedPage>,
 }
 
 impl WorkerOutput {
@@ -358,7 +387,7 @@ impl WorkerOutput {
         WorkerOutput {
             root: None,
             witnessed_paths: if witness { Some(Vec::new()) } else { None },
-            page_diffs: Vec::new(),
+            updated_pages: Vec::new(),
         }
     }
 }
@@ -368,7 +397,9 @@ struct UpdateShared {
     read_write: Vec<(KeyPath, KeyReadWrite)>,
     // nodes needing to be written to pages above a shard.
     root_page_pending: Mutex<Vec<(TriePosition, RootPagePending)>>,
+    overlay: LiveOverlay,
     witness: bool,
+    into_overlay: bool,
 }
 
 impl UpdateShared {
@@ -408,7 +439,7 @@ impl UpdateShared {
 struct WarmUpHandle {
     finish_tx: Sender<()>,
     warmup_tx: Sender<WarmUpCommand>,
-    output_rx: Receiver<HashMap<KeyPath, Seek>>,
+    output_rx: Receiver<WarmUpOutput>,
 }
 
 fn spawn_warm_up<H: HashAlgorithm>(
@@ -443,4 +474,34 @@ fn spawn_updater<H: HashAlgorithm>(
             .with_context(|| format!("worker {} erred out", worker_id));
         let _ = output_tx.send(output);
     });
+}
+
+fn get_in_memory_page(
+    overlay: &LiveOverlay,
+    page_cache: &PageCache,
+    page_id: &PageId,
+) -> Option<(Page, BucketInfo)> {
+    overlay
+        .page(page_id)
+        .map(|page| {
+            let bucket_info = match page.bucket {
+                BucketInfo::Known(ref b) => BucketInfo::Known(*b),
+                BucketInfo::FreshOrDependent(ref maybe) => {
+                    if let Some(bucket) = maybe.get() {
+                        BucketInfo::Known(bucket)
+                    } else {
+                        BucketInfo::FreshOrDependent(maybe.clone())
+                    }
+                }
+                // PANIC: overlays are never created with `FreshWithNoDependents`.
+                BucketInfo::FreshWithNoDependents => panic!(),
+            };
+
+            (page.page.clone(), bucket_info)
+        })
+        .or_else(|| {
+            page_cache
+                .get(page_id.clone())
+                .map(|(page, bucket)| (page, BucketInfo::Known(bucket)))
+        })
 }

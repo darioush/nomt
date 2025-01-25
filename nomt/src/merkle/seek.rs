@@ -4,13 +4,15 @@ use crate::{
     beatree::{
         iterator::{IterOutput, NeededLeavesIter},
         AsyncLeafLoad, BeatreeIterator, LeafNodeRef, PageNumber, ReadTransaction as BeatreeReadTx,
+        ValueChange,
     },
     io::{CompleteIo, FatPage, IoHandle},
-    page_cache::{Page, PageCache, ShardIndex},
-    rw_pass_cell::ReadPass,
-    store::{BucketIndex, PageLoad, PageLoader},
+    page_cache::{Page, PageCache, PageMut},
+    store::{BucketIndex, BucketInfo, PageLoad, PageLoader},
     HashAlgorithm,
 };
+
+use super::{page_set::PageSet, LiveOverlay};
 
 use nomt_core::{
     page::DEPTH,
@@ -41,13 +43,14 @@ struct SeekRequest {
 impl SeekRequest {
     fn new<H: HashAlgorithm>(
         read_transaction: &BeatreeReadTx,
+        overlay: &LiveOverlay,
         key: KeyPath,
         root: Node,
     ) -> SeekRequest {
         let state = if trie::is_terminator(&root) {
             RequestState::Completed(None)
         } else if trie::is_leaf(&root) {
-            RequestState::begin_leaf_fetch(read_transaction, &TriePosition::new())
+            RequestState::begin_leaf_fetch::<H>(read_transaction, overlay, &TriePosition::new())
         } else {
             RequestState::Seeking
         };
@@ -99,8 +102,8 @@ impl SeekRequest {
 
     fn continue_seek<H: HashAlgorithm>(
         &mut self,
-        read_pass: &ReadPass<ShardIndex>,
         read_transaction: &BeatreeReadTx,
+        overlay: &LiveOverlay,
         page_id: PageId,
         page: &Page,
         record_siblings: bool,
@@ -125,15 +128,17 @@ impl SeekRequest {
         for bit in bits {
             self.position.down(bit);
 
-            let cur_node = page.node(&read_pass, self.position.node_index());
+            let cur_node = page.node(self.position.node_index());
             if record_siblings {
-                self.siblings
-                    .push(page.node(&read_pass, self.position.sibling_index()));
+                self.siblings.push(page.node(self.position.sibling_index()));
             }
 
             if trie::is_leaf(&cur_node) {
-                self.state = RequestState::begin_leaf_fetch(read_transaction, &self.position);
-                do_leaf_fetch = true;
+                self.state =
+                    RequestState::begin_leaf_fetch::<H>(read_transaction, overlay, &self.position);
+                if let RequestState::FetchingLeaf(_, _) = self.state {
+                    do_leaf_fetch = true;
+                }
                 break;
             } else if trie::is_terminator(&cur_node) {
                 self.state = RequestState::Completed(None);
@@ -178,8 +183,34 @@ enum RequestState {
 }
 
 impl RequestState {
-    fn begin_leaf_fetch(read_transaction: &BeatreeReadTx, pos: &TriePosition) -> Self {
+    fn begin_leaf_fetch<H: HashAlgorithm>(
+        read_transaction: &BeatreeReadTx,
+        overlay: &LiveOverlay,
+        pos: &TriePosition,
+    ) -> Self {
         let (start, end) = range_bounds(pos.raw_path(), pos.depth() as usize);
+
+        // First see if the item is present within the overlay.
+        let overlay_item = overlay
+            .value_iter(start, end)
+            .filter(|(_, v)| v.as_option().is_some())
+            .next();
+
+        if let Some((key_path, overlay_leaf)) = overlay_item {
+            let value_hash = match overlay_leaf {
+                // PANIC: we filtered out all deletions above.
+                ValueChange::Delete => panic!(),
+                ValueChange::Insert(value) => H::hash_value(value),
+                ValueChange::InsertOverflow(_, value_hash) => value_hash.clone(),
+            };
+
+            return RequestState::Completed(Some(trie::LeafData {
+                key_path,
+                value_hash,
+            }));
+        }
+
+        // Fall back to iterator (most likely).
         let iter = read_transaction.iterator(start, end);
         let needed_leaves = iter.needed_leaves();
         RequestState::FetchingLeaf(iter, needed_leaves)
@@ -232,11 +263,12 @@ enum IoRequest {
 /// path to the terminal node are in the page cache. This includes the page that contains the leaf
 /// children of the request.
 ///
-/// Requests are completed in the order the are submitted.
+/// Requests are completed in the order they are submitted.
 pub struct Seeker<H: HashAlgorithm> {
     root: Node,
     beatree_read_transaction: BeatreeReadTx,
     page_cache: PageCache,
+    overlay: LiveOverlay,
     io_handle: IoHandle,
     page_loader: PageLoader,
     processed: usize,
@@ -257,6 +289,7 @@ impl<H: HashAlgorithm> Seeker<H> {
         root: Node,
         beatree_read_transaction: BeatreeReadTx,
         page_cache: PageCache,
+        overlay: LiveOverlay,
         io_handle: IoHandle,
         page_loader: PageLoader,
         record_siblings: bool,
@@ -265,6 +298,7 @@ impl<H: HashAlgorithm> Seeker<H> {
             root,
             beatree_read_transaction,
             page_cache,
+            overlay,
             io_handle,
             page_loader,
             processed: 0,
@@ -295,12 +329,12 @@ impl<H: HashAlgorithm> Seeker<H> {
     }
 
     /// Try to submit as many requests as possible.
-    pub fn submit_all(&mut self, read_pass: &ReadPass<ShardIndex>) -> anyhow::Result<()> {
+    pub fn submit_all(&mut self, page_set: &mut PageSet) -> anyhow::Result<()> {
         if !self.has_room() {
             return Ok(());
         }
-        self.submit_idle_page_loads(read_pass)?;
-        self.submit_idle_key_path_requests(read_pass)?;
+        self.submit_idle_page_loads()?;
+        self.submit_idle_key_path_requests(page_set)?;
 
         Ok(())
     }
@@ -331,18 +365,18 @@ impl<H: HashAlgorithm> Seeker<H> {
     }
 
     /// Try to process the next I/O. Does not block the current thread.
-    pub fn try_recv_page(&mut self, read_pass: &ReadPass<ShardIndex>) -> anyhow::Result<()> {
+    pub fn try_recv_page(&mut self, page_set: &mut PageSet) -> anyhow::Result<()> {
         if let Ok(io) = self.io_handle.try_recv() {
-            self.handle_completion(read_pass, io)?;
+            self.handle_completion(page_set, io)?;
         }
 
         Ok(())
     }
 
     /// Block on processing the next I/O. Blocks the current thread.
-    pub fn recv_page(&mut self, read_pass: &ReadPass<ShardIndex>) -> anyhow::Result<()> {
+    pub fn recv_page(&mut self, page_set: &mut PageSet) -> anyhow::Result<()> {
         let io = self.io_handle.recv()?;
-        self.handle_completion(read_pass, io)?;
+        self.handle_completion(page_set, io)?;
         Ok(())
     }
 
@@ -351,6 +385,7 @@ impl<H: HashAlgorithm> Seeker<H> {
         let request_index = self.processed + self.requests.len();
         self.requests.push_back(SeekRequest::new::<H>(
             &self.beatree_read_transaction,
+            &self.overlay,
             key,
             self.root,
         ));
@@ -358,9 +393,9 @@ impl<H: HashAlgorithm> Seeker<H> {
     }
 
     // resubmit all idle page loads until no more remain.
-    fn submit_idle_page_loads(&mut self, read_pass: &ReadPass<ShardIndex>) -> anyhow::Result<()> {
+    fn submit_idle_page_loads(&mut self) -> anyhow::Result<()> {
         while let Some(slab_index) = self.idle_page_loads.pop_front() {
-            self.submit_idle_page_load(read_pass, slab_index)?;
+            self.submit_idle_page_load(slab_index)?;
         }
 
         Ok(())
@@ -368,15 +403,12 @@ impl<H: HashAlgorithm> Seeker<H> {
 
     // submit the next page for each idle key path request until backpressuring or no more progress
     // can be made.
-    fn submit_idle_key_path_requests(
-        &mut self,
-        read_pass: &ReadPass<ShardIndex>,
-    ) -> anyhow::Result<()> {
+    fn submit_idle_key_path_requests(&mut self, page_set: &mut PageSet) -> anyhow::Result<()> {
         while self.has_room() {
             match self.idle_requests.pop_front() {
                 None => return Ok(()),
                 Some(request_index) => {
-                    self.submit_key_path_request(read_pass, request_index)?;
+                    self.submit_key_path_request(page_set, request_index)?;
                 }
             }
         }
@@ -385,18 +417,21 @@ impl<H: HashAlgorithm> Seeker<H> {
     }
 
     // submit a page load which is currently in the slab, but idle.
-    fn submit_idle_page_load(
-        &mut self,
-        read_pass: &ReadPass<ShardIndex>,
-        slab_index: usize,
-    ) -> anyhow::Result<()> {
+    fn submit_idle_page_load(&mut self, slab_index: usize) -> anyhow::Result<()> {
         if let IoRequest::Merkle(ref mut page_load) = self.io_slab[slab_index] {
             if !self
                 .page_loader
                 .probe(page_load, &self.io_handle, slab_index as u64)?
             {
-                // guaranteed fresh page
-                self.handle_merkle_page_and_continue(read_pass, slab_index, None);
+                // PANIC: seek should really never reach fresh pages. we only request a page if
+                // we seek to an internal node above it, and in that case the page really should
+                // exist.
+                //
+                // This code path being reached indicates that the page definitely doesn't exist
+                // within the hash-table.
+                //
+                // Maybe better to return an error here. it indicates some kind of DB corruption.
+                unreachable!()
             }
         }
 
@@ -406,7 +441,7 @@ impl<H: HashAlgorithm> Seeker<H> {
     // submit the next page for this key path request.
     fn submit_key_path_request(
         &mut self,
-        read_pass: &ReadPass<ShardIndex>,
+        page_set: &mut PageSet,
         request_index: usize,
     ) -> anyhow::Result<()> {
         let i = if request_index < self.processed {
@@ -420,14 +455,17 @@ impl<H: HashAlgorithm> Seeker<H> {
         while let Some(query) = request.next_query() {
             match query {
                 IoQuery::MerklePage(page_id) => {
-                    if let Some(page) = self.page_cache.get(page_id.clone()) {
+                    let maybe_in_memory =
+                        super::get_in_memory_page(&self.overlay, &self.page_cache, &page_id);
+                    if let Some((page, bucket_info)) = maybe_in_memory {
                         request.continue_seek::<H>(
-                            read_pass,
                             &self.beatree_read_transaction,
-                            page_id,
+                            &self.overlay,
+                            page_id.clone(),
                             &page,
                             self.record_siblings,
                         );
+                        page_set.insert(page_id, page, bucket_info);
                         continue;
                     }
 
@@ -446,7 +484,7 @@ impl<H: HashAlgorithm> Seeker<H> {
                     let load = self.page_loader.start_load(page_id.clone());
                     vacant_entry.insert(vec![request_index]);
                     let slab_index = self.io_slab.insert(IoRequest::Merkle(load));
-                    return self.submit_idle_page_load(read_pass, slab_index);
+                    return self.submit_idle_page_load(slab_index);
                 }
                 IoQuery::LeafPage(page_number) => {
                     let vacant_entry = match self.io_waiters.entry(IoQuery::LeafPage(page_number)) {
@@ -483,11 +521,7 @@ impl<H: HashAlgorithm> Seeker<H> {
         Ok(())
     }
 
-    fn handle_completion(
-        &mut self,
-        read_pass: &ReadPass<ShardIndex>,
-        io: CompleteIo,
-    ) -> anyhow::Result<()> {
+    fn handle_completion(&mut self, page_set: &mut PageSet, io: CompleteIo) -> anyhow::Result<()> {
         io.result?;
         let slab_index = io.command.user_data as usize;
 
@@ -498,7 +532,9 @@ impl<H: HashAlgorithm> Seeker<H> {
                 // UNWRAP: page loader always submits a `Read` command that yields a fat page.
                 let page = io.command.kind.unwrap_buf();
                 match merkle_load.try_complete(page) {
-                    Some(p) => self.handle_merkle_page_and_continue(read_pass, slab_index, Some(p)),
+                    Some((page, bucket)) => {
+                        self.handle_merkle_page_and_continue(page_set, slab_index, page, bucket)
+                    }
                     None => self.idle_page_loads.push_back(slab_index),
                 };
             }
@@ -513,17 +549,26 @@ impl<H: HashAlgorithm> Seeker<H> {
 
     fn handle_merkle_page_and_continue(
         &mut self,
-        read_pass: &ReadPass<ShardIndex>,
+        page_set: &mut PageSet,
         slab_index: usize,
-        page_data: Option<(FatPage, BucketIndex)>,
+        page_data: FatPage,
+        bucket_index: BucketIndex,
     ) {
         let IoRequest::Merkle(page_load) = self.io_slab.remove(slab_index) else {
             panic!()
         };
 
+        let page = PageMut::pristine_with_data(page_data).freeze();
+
+        // insert the page into the page cache and working page set.
         let page = self
             .page_cache
-            .insert(page_load.page_id().clone(), page_data);
+            .insert(page_load.page_id().clone(), page.clone(), bucket_index);
+        page_set.insert(
+            page_load.page_id().clone(),
+            page.clone(),
+            BucketInfo::Known(bucket_index),
+        );
 
         for waiting_request in self
             .io_waiters
@@ -539,8 +584,8 @@ impl<H: HashAlgorithm> Seeker<H> {
             assert!(!request.is_completed());
 
             request.continue_seek::<H>(
-                read_pass,
                 &self.beatree_read_transaction,
+                &self.overlay,
                 page_load.page_id().clone(),
                 &page,
                 self.record_siblings,

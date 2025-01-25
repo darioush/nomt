@@ -11,8 +11,11 @@ use crate::{
             self,
             bit_ops::separate,
             update::{
-                branch_stage::BranchStageOutput, branch_updater::tests::make_branch_until, get_key,
-                leaf_stage::LeafStageOutput, LEAF_MERGE_THRESHOLD,
+                branch_stage::BranchStageOutput,
+                branch_updater::tests::make_branch_until,
+                get_key,
+                leaf_stage::{self, LeafStageOutput},
+                BRANCH_MERGE_THRESHOLD, LEAF_MERGE_THRESHOLD,
             },
         },
         Index, ValueChange,
@@ -27,8 +30,6 @@ use std::collections::BTreeSet;
 use std::fs::File;
 use std::sync::Arc;
 use threadpool::ThreadPool;
-
-use super::BRANCH_MERGE_THRESHOLD;
 
 const LEAF_STAGE_INITIAL_CAPACITY: usize = 700;
 const BRANCH_STAGE_INITIAL_CAPACITY: usize = 50_000;
@@ -60,7 +61,7 @@ lazy_static! {
     static ref PAGE_POOL: PagePool = PagePool::new();
     static ref IO_POOL: IoPool = start_test_io_pool(3, PAGE_POOL.clone());
     static ref TREE_DATA: TreeData = init_beatree();
-    static ref BBN_INDEX: Index = init_bbn_index();
+    static ref BBN_INDEX: Index = init_bbn_index(&SEPARATORS);
     static ref THREAD_POOL: ThreadPool =
         ThreadPool::with_name("beatree-update-test".to_string(), 64);
 }
@@ -170,6 +171,45 @@ impl Arbitrary for Key {
     }
 }
 
+#[derive(Clone, Debug)]
+struct StageInputs {
+    insertions: BTreeMap<Key, u16>,
+    deletions: Vec<u16>,
+    no_shrinking: bool,
+}
+
+impl Arbitrary for StageInputs {
+    fn arbitrary(g: &mut Gen) -> Self {
+        // If NO_STAGES_SHRINKING is specified as true,
+        // it stops the shrinking process from occurring,
+        // returning immediately if an error is found.
+        let no_shrinking = std::env::var("NO_STAGES_SHRINKING")
+            .ok()
+            .map(|no_shrinking| no_shrinking.to_lowercase() == "true")
+            .unwrap_or(false);
+
+        Self {
+            insertions: BTreeMap::<Key, u16>::arbitrary(g),
+            deletions: Vec::<u16>::arbitrary(g),
+            no_shrinking,
+        }
+    }
+
+    fn shrink(&self) -> Box<dyn Iterator<Item = Self>> {
+        if self.no_shrinking {
+            return quickcheck::empty_shrinker();
+        }
+
+        Box::new(self.insertions.shrink().zip(self.deletions.shrink()).map(
+            |(insertions, deletions)| Self {
+                insertions,
+                deletions,
+                no_shrinking: false,
+            },
+        ))
+    }
+}
+
 fn leaf_page_numbers(
     bbn_index: &Index,
     keys: impl IntoIterator<Item = [u8; 32]>,
@@ -249,7 +289,12 @@ fn is_valid_leaf_stage_output(
     expected_values.retain(|k, _| !deletions.contains(k));
 
     let mut found_underfull_leaf = false;
-    for (_, new_pn) in output.leaf_changeset.into_iter() {
+    for (separator, new_pn) in output.leaf_changeset.into_iter() {
+        if separator == [0; 32] && new_pn.is_none() {
+            // First leaf with separator of all 0 cannot be eliminated.
+            return false;
+        }
+
         let Some(new_pn) = new_pn else { continue };
         let page = leaf_reader.query(new_pn);
         let leaf_node = LeafNode { inner: page };
@@ -310,15 +355,17 @@ fn rescale(init: u16, lower_bound: usize, upper_bound: usize) -> usize {
 
 // insertions is a map of arbitrary keys associated with value sizes, while deletions
 // is a vector of numbers that will be used to index the vector of already present keys
-fn leaf_stage_inner(insertions: BTreeMap<Key, u16>, deletions: Vec<u16>) -> TestResult {
-    let deletions: BTreeMap<_, _> = deletions
+fn leaf_stage_inner(input: StageInputs) -> TestResult {
+    let deletions: BTreeMap<_, _> = input
+        .deletions
         .into_iter()
         // rescale deletions to contain indexes over only alredy present items in the db
         .map(|d| rescale(d, 0, KEYS.len()))
         .map(|index| (KEYS[index], ValueChange::Delete))
         .collect();
 
-    let insertions: BTreeMap<_, _> = insertions
+    let insertions: BTreeMap<_, _> = input
+        .insertions
         .into_iter()
         // rescale raw_size to be between 0 and MAX_LEAF_VALUE_SIZE
         .map(|(k, raw_size)| (k, rescale(raw_size, 1, MAX_LEAF_VALUE_SIZE)))
@@ -347,7 +394,7 @@ fn leaf_stage() {
         QuickCheck::new()
             .gen(Gen::new(LEAF_STAGE_CHANGESET_AVG_SIZE))
             .max_tests(MAX_TESTS)
-            .quickcheck(leaf_stage_inner as fn(_, _) -> TestResult)
+            .quickcheck(leaf_stage_inner as fn(_) -> TestResult)
     });
 
     if let Err(cause) = test_result {
@@ -356,20 +403,21 @@ fn leaf_stage() {
     }
 }
 
-// Initialize a bbn_index using the separators present in SEPARATORS.
+// Initialize a bbn_index using the provided separators.
 // The reasons why this initialization is required are the same as those for `init_beatree`
-fn init_bbn_index() -> Index {
+// It is also used by `enforce_first_leaf_separator` to avoid initializing the entire beatree.
+fn init_bbn_index(separators: &[[u8; 32]]) -> Index {
     let mut rng = rand_pcg::Lcg64Xsh32::from_seed(*SEED);
 
     let mut bbn_index = Index::default();
     let mut used_separators = 0;
     let mut bbn_pn = 0;
 
-    while used_separators < SEPARATORS.len() {
+    while used_separators < separators.len() {
         let body_size_target = rng.gen_range(BRANCH_MERGE_THRESHOLD..BRANCH_NODE_BODY_SIZE);
 
         let branch_node = make_branch_until(
-            &mut SEPARATORS[used_separators..].iter().cloned(),
+            &mut separators[used_separators..].iter().cloned(),
             body_size_target,
             bbn_pn,
         );
@@ -451,19 +499,21 @@ fn is_valid_branch_stage_output(
 
 // insertions is a map of arbitrary keys associated with a PageNumber, while deletions
 // is a vector of numbers that will be used to index the vector of already present SEPARATORS
-fn branch_stage_inner(insertions: BTreeMap<Key, u32>, deletions: Vec<u16>) -> TestResult {
+fn branch_stage_inner(input: StageInputs) -> TestResult {
     let bbn_index = BBN_INDEX.clone();
 
-    let deletions: BTreeMap<_, _> = deletions
+    let deletions: BTreeMap<_, _> = input
+        .deletions
         .into_iter()
         // rescale deletions to contain indexes over only alredy present items in the db
         .map(|d| rescale(d, 0, SEPARATORS.len()))
         .map(|index| (SEPARATORS[index], None))
         .collect();
 
-    let insertions: BTreeMap<_, _> = insertions
+    let insertions: BTreeMap<_, _> = input
+        .insertions
         .into_iter()
-        .map(|(k, raw_pn)| (k.inner, Some(PageNumber(raw_pn))))
+        .map(|(k, raw_pn)| (k.inner, Some(PageNumber(raw_pn as u32))))
         .collect();
 
     let bbn_fd = tempfile::tempfile().unwrap();
@@ -540,11 +590,107 @@ fn branch_stage() {
         QuickCheck::new()
             .gen(Gen::new(BRANCH_STAGE_CHANGESET_AVG_SIZE))
             .max_tests(MAX_TESTS)
-            .quickcheck(branch_stage_inner as fn(_, _) -> TestResult)
+            .quickcheck(branch_stage_inner as fn(_) -> TestResult)
     });
 
     if let Err(cause) = test_result {
         eprintln!("branch_stage failed with seed: {:?}", *SEED);
         std::panic::resume_unwind(cause);
     }
+}
+
+#[test]
+fn enforce_first_leaf_separator() {
+    let mut separators = vec![[0; 32]];
+    let keys = rand_keys(9);
+    separators.extend(keys.windows(2).map(|w| separate(&w[0], &w[1])));
+    // NOTE: The test relies entirely on the fact that `init_bbn_index`
+    // uses `make_branch_until`, which assigns page numbers in ascending order starting from 0.
+    let bbn_index = init_bbn_index(&separators);
+
+    // nothing changes, first leaf not deleted
+    let mut leaf_changeset = vec![([1; 32], Some(PageNumber(1))), ([2; 32], None)];
+    let prev_stage = leaf_changeset.clone();
+    leaf_stage::enforce_first_leaf_separator(&mut leaf_changeset, &bbn_index);
+    assert_eq!(leaf_changeset, prev_stage);
+
+    // nothing changes, all leaves deleted
+    let mut leaf_changeset = separators.iter().map(|s| (*s, None)).collect::<Vec<_>>();
+    let prev_stage = leaf_changeset.clone();
+    leaf_stage::enforce_first_leaf_separator(&mut leaf_changeset, &bbn_index);
+    assert_eq!(leaf_changeset, prev_stage);
+
+    // The new first leaf is within the previous leaves, all deleted in changeset
+    let n_take = 5;
+    let mut leaf_changeset = separators
+        .iter()
+        .map(|s| (*s, None))
+        .take(n_take)
+        .collect::<Vec<_>>();
+    leaf_stage::enforce_first_leaf_separator(&mut leaf_changeset, &bbn_index);
+
+    // new first leaf
+    assert_eq!(leaf_changeset[0].0, [0; 32]);
+    assert_eq!(leaf_changeset[0].1, Some(PageNumber(n_take as u32)));
+    // All others are expected to be deleted leaves,
+    // in particular, the previous separator associated with the new first leaf is deleted.
+    for (_, leaf_pn) in &leaf_changeset[1..] {
+        assert!(leaf_pn.is_none());
+    }
+    assert_eq!(leaf_changeset.len(), n_take + 1);
+
+    // The new first leaf is within the previous leaves,
+    // some deleted before finding it
+    let n_take = 5;
+    let mut leaf_changeset = separators
+        .iter()
+        .map(|s| (*s, None))
+        .take(n_take)
+        .collect::<Vec<_>>();
+    // this is the new leaf with a bigger separator than one of the previous
+    leaf_changeset.push((keys[n_take + 1], Some(PageNumber(15))));
+    leaf_stage::enforce_first_leaf_separator(&mut leaf_changeset, &bbn_index);
+
+    // new first leaf
+    assert_eq!(leaf_changeset[0].0, [0; 32]);
+    assert_eq!(leaf_changeset[0].1, Some(PageNumber(n_take as u32)));
+    // + 1 = the leaf we pushed
+    // + 1 = deletion of the separator of the new first leaf
+    assert_eq!(leaf_changeset.len(), n_take + 2);
+
+    // The new first leaf is a new leaf, some deleted before finding it
+    let n_take = 5;
+    let mut leaf_changeset = separators
+        .iter()
+        .map(|s| (*s, None))
+        .take(n_take)
+        .collect::<Vec<_>>();
+    // this is the new leaf with a smaller separator than one of the previous
+    leaf_changeset.push((keys[n_take - 1], Some(PageNumber(15))));
+    leaf_stage::enforce_first_leaf_separator(&mut leaf_changeset, &bbn_index);
+
+    // new first leaf
+    assert_eq!(leaf_changeset[0].0, [0; 32]);
+    assert_eq!(leaf_changeset[0].1, Some(PageNumber(15)));
+    //  leaf_changeset len in n_take + 1, but the item associated
+    //  to the new first leaf is removed
+    assert_eq!(leaf_changeset.len(), n_take);
+
+    // The new first leaf is an updated version of a previous leaf,
+    // something deleted before finding it
+    let n_take = 5;
+    let mut leaf_changeset = separators
+        .iter()
+        .map(|s| (*s, None))
+        .take(n_take)
+        .collect::<Vec<_>>();
+    // this is the new leaf with a smaller separator than one of the previous
+    leaf_changeset.push((separators[n_take], Some(PageNumber(15))));
+    leaf_stage::enforce_first_leaf_separator(&mut leaf_changeset, &bbn_index);
+
+    // new first leaf
+    assert_eq!(leaf_changeset[0].0, [0; 32]);
+    assert_eq!(leaf_changeset[0].1, Some(PageNumber(15)));
+    assert_eq!(leaf_changeset[n_take].1, None);
+    assert_eq!(leaf_changeset.len(), n_take + 1);
 }

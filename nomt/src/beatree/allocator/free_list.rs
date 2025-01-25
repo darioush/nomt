@@ -43,6 +43,7 @@ impl FreeList {
         };
 
         // restore free list from file
+        let max_pn = (store_file.metadata()?.len() as usize / PAGE_SIZE) as u32;
         let mut free_list_portions = vec![];
         loop {
             if free_list_pn.is_nil() {
@@ -51,7 +52,7 @@ impl FreeList {
 
             let page = io::read_page(page_pool, store_file, free_list_pn.0 as u64)?;
 
-            let (prev, free_list) = decode_free_list_page(page);
+            let (prev, free_list) = decode_free_list_page(page, max_pn);
             free_list_portions.push((free_list_pn, free_list));
             free_list_pn = prev;
         }
@@ -86,7 +87,7 @@ impl FreeList {
         self.portions.last().map(|(head_pn, _)| head_pn).copied()
     }
 
-    pub fn pop(&mut self) -> Option<PageNumber> {
+    fn pop(&mut self) -> Option<PageNumber> {
         let pn;
         let head_empty = {
             let head = self.portions.last_mut()?;
@@ -178,29 +179,28 @@ impl FreeList {
         bump: &mut PageNumber,
     ) -> Vec<(PageNumber, FatPage)> {
         // No changes were made
-        if !self.pop && to_push.is_empty() {
+        let had_pops = std::mem::replace(&mut self.pop, false);
+        if !had_pops && to_push.is_empty() {
             return vec![];
         }
 
         // append the released free list pages
         to_push.extend(self.released_portions.drain(..));
 
-        if self.pop && to_push.is_empty() {
+        if had_pops && to_push.is_empty() {
             // note: empty vec when head is empty.
             return self.encode_head(page_pool).into_iter().collect();
         }
 
-        self.pop = false;
-
         let new_pages = self.preallocate(&mut to_push, bump);
         let pages = self.push_and_encode(page_pool, &to_push, new_pages);
+        // preallocate pops, therefore, we must set it back.
+        self.pop = false;
 
         let (len, fragmented) = len_and_fragmented(&self.portions);
         self.len = len;
         self.fragmented = fragmented;
 
-        // preallocate pops, therefore, we must set it back.
-        self.pop = false;
         pages
     }
 
@@ -396,7 +396,7 @@ fn len_and_fragmented(portions: &[(PageNumber, Vec<PageNumber>)]) -> (usize, boo
 }
 
 // returns the previous PageNumber and all the PageNumbers stored in the free list page
-fn decode_free_list_page(page: FatPage) -> (PageNumber, Vec<PageNumber>) {
+fn decode_free_list_page(page: FatPage, max_pn: u32) -> (PageNumber, Vec<PageNumber>) {
     let free_list_page_view = FreeListPageRef(&page[..]);
 
     let prev = free_list_page_view.prev_pn();
@@ -404,6 +404,8 @@ fn decode_free_list_page(page: FatPage) -> (PageNumber, Vec<PageNumber>) {
     let mut free_list = vec![];
     for i in 0..item_count as usize {
         let pn = free_list_page_view.item(i);
+        // Ensure each PageNumber falls within the file bounds.
+        assert!(pn.0 < max_pn);
         free_list.push(pn);
     }
 
