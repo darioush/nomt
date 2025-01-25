@@ -130,7 +130,7 @@ struct Args {
 
 
     // Number of hashtable buckets
-    #[arg(short, long, default_value = "64000")]
+    #[arg(long, default_value = "64000")]
     hashtable_buckets: u32,
 }
 
