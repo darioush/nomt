@@ -82,7 +82,7 @@ fn handle_client(mut stream: UnixStream, nomt: &Nomt<Blake3Hasher>, session: Ses
                 }).collect();
                 actual_access.sort_by_key(|(k, _)| *k);
 
-                let root= nomt.commit(next_session, actual_access).unwrap();
+                let root= nomt.update_and_commit(next_session, actual_access).unwrap();
                 next_session = nomt.begin_session();
                 Response {
                     err_code: 0,
